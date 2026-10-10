@@ -59,7 +59,9 @@ class LowPrecisionLinear(nn.Linear):
         """Create a no-allocation shell retaining the source Parameters."""
 
         cls._validate_strategy(strategy)
-        converted = cls.__new__(cls)
+        # object.__new__ is a static method; passing cls explicitly avoids the
+        # allocation and initialization performed by nn.Linear.__init__.
+        converted = cls.__new__(cls)  # pylint: disable=no-value-for-parameter
         nn.Module.__init__(converted)  # pylint: disable=unnecessary-dunder-call
         converted.in_features = linear.in_features
         converted.out_features = linear.out_features

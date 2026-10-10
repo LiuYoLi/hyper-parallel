@@ -60,6 +60,8 @@ class _DenseStorage:
         self.colwise = colwise
 
     def update_usage(self, rowwise=True, colwise=True):
+        """Record which operand orientations the grouped strategy will use."""
+
         self.rowwise = self.rowwise and rowwise
         self.colwise = self.colwise and colwise
 
@@ -115,6 +117,8 @@ class _DenseGroupedLinear(GroupedLinear):
         group_list_type,
         output_dtype,
     ):
+        """Apply the grouped matrix product independently to each expert."""
+
         del group_type
         counts = self._counts(group_list, group_list_type)
         left_parts = left.value.split(counts, dim=0)
