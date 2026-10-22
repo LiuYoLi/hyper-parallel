@@ -32,9 +32,6 @@ class MXFP8GroupedLinear(GroupedLinear):
     """Bind MXFP8 quantization and GMM lowering to the common native flow."""
 
     FORMAT_NAME = "MXFP8"
-    # CANN may promote MXFP8 GMM results to FP32; routed model states must
-    # return to the activation dtype before the next Transformer operator.
-    CAST_ROUTED_OUTPUT_TO_INPUT_DTYPE = True
 
     def __init__(self, quantizer: Optional[MXFP8Quantizer] = None) -> None:
         """Create one reusable MXFP8 strategy and own its quantizer."""

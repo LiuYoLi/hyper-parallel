@@ -37,8 +37,6 @@ class FakeW4A8GroupedLinear(GroupedLinear):
     """
 
     FORMAT_NAME = "Fake W4A8"
-    # Fake GMM follows the native path and may also produce promoted output.
-    CAST_ROUTED_OUTPUT_TO_INPUT_DTYPE = True
 
     def __init__(self, block_size: int = MX_BLOCK_SIZE_32) -> None:
         """Create a fake-W4A8 grouped strategy for one MX block size."""

@@ -34,8 +34,6 @@ class W4A8GroupedLinear(GroupedLinear):
     """Bind W4A8's target-layout views and native GMM lowering."""
 
     FORMAT_NAME = "Native W4A8"
-    # Keep the routed result compatible with BF16/FP16 Transformer operators.
-    CAST_ROUTED_OUTPUT_TO_INPUT_DTYPE = True
 
     def __init__(self, block_size: int = MX_BLOCK_SIZE_32) -> None:
         """Create one reusable W4A8 strategy and own its quantizer."""
