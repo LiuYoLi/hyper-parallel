@@ -20,6 +20,7 @@ from typing import Optional
 import torch  # pylint: disable=forbidden-backend-import
 from torch.autograd.function import once_differentiable  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.quantization.config import MATRIX_NDIM
 from hyper_parallel.components.quantization.tensor import QuantizedTensorStorage
 from hyper_parallel.components.quantization.tensor.quantized_tensor import QuantizedTensor
 from hyper_parallel.components.quantization.functional._saved_quantized import (
@@ -31,7 +32,7 @@ from hyper_parallel.components.quantization.functional._saved_quantized import (
 def _as_matrix(tensor: torch.Tensor) -> torch.Tensor:
     """Flatten leading dimensions while preserving the contracting axis."""
 
-    if tensor.ndim == 2:
+    if tensor.ndim == MATRIX_NDIM:
         return tensor
     return tensor.reshape(-1, tensor.shape[-1])
 
@@ -131,7 +132,7 @@ class LinearStrategy(ABC):
             ctx.weight_quant = None
         else:
             ctx.input_quant, ctx.weight_quant = operands
-        if inputs.ndim != 2:
+        if inputs.ndim != MATRIX_NDIM:
             output = output.reshape(*inputs.shape[:-1], output.shape[-1])
         return output
 
@@ -165,7 +166,7 @@ class LinearStrategy(ABC):
                 layout="NN",
                 output_dtype=grad_output.dtype,
             )
-            if len(ctx.input_shape) != 2:
+            if len(ctx.input_shape) != MATRIX_NDIM:
                 grad_input = grad_input.reshape(ctx.input_shape)
         if needs_grad_weight:
             grad_weight = self.matmul(

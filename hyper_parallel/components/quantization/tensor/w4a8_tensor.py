@@ -170,6 +170,7 @@ class W4A8Tensor(W4A8TensorStorage, QuantizedTensor):
         """Rebuild the wrapper after transforming physical tensors."""
 
         def transform_optional(value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            """Apply the physical-tensor transform while preserving absence."""
             return None if value is None else transform(value)
 
         return type(self)(
