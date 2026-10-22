@@ -182,11 +182,13 @@ class LinearStrategy(ABC):
         return grad_input, grad_weight
 
 
-class _LinearFunction(torch.autograd.Function):
+# PyTorch's Function base exposes variadic callbacks; this bridge intentionally
+# specializes them for the dense-linear ``apply`` contract.
+class _LinearFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
     """Bridge PyTorch autograd callbacks to one bound Dense strategy."""
 
     @staticmethod
-    def forward(
+    def forward(  # pylint: disable=arguments-differ
         ctx: torch.autograd.function.FunctionCtx,
         inputs: torch.Tensor,
         weight: torch.Tensor,
@@ -198,7 +200,7 @@ class _LinearFunction(torch.autograd.Function):
 
     @staticmethod
     @once_differentiable
-    def backward(
+    def backward(  # pylint: disable=arguments-differ
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], None]:

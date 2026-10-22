@@ -79,6 +79,7 @@ class FakeW4A8Quantizer(Quantizer):
         group_list: Optional[torch.Tensor],
         group_list_type: int,
     ) -> MXFP8Tensor:
+        """Quantize an activation in the requested row/column directions."""
         boundaries = self._boundaries(group_list, group_list_type)
         row_data, row_scale, col_data, col_scale = self._quantize_activation_block32(
             tensor,
@@ -148,6 +149,7 @@ class FakeW4A8Quantizer(Quantizer):
         rowwise: bool,
         colwise: bool,
     ) -> MXFP8Tensor:
+        """Quantize a grouped master weight through the fake W4A8 path."""
         if tensor.ndim != GROUPED_NDIM:
             raise ValueError(
                 "Fake W4A8 GMM weights must be [experts,K,N], "

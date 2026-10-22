@@ -150,8 +150,7 @@ class W4A8Tensor(W4A8TensorStorage, QuantizedTensor):
         """Initialize the wrapper's directional storage."""
 
         del device, requires_grad
-        W4A8TensorStorage.__init__(
-            self,
+        super().__init__(
             shape,
             dtype,
             quantizer=quantizer,

@@ -83,6 +83,7 @@ class HiFloat8Quantizer(Quantizer):
         rowwise: bool,
         colwise: bool,
     ) -> None:
+        """Validate tensor dtype, rank, directions, and group metadata."""
         if not isinstance(tensor, torch.Tensor) or isinstance(
             tensor,
             QuantizedTensor,

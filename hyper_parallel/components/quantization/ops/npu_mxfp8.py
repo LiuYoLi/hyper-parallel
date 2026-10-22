@@ -260,6 +260,7 @@ def _left_operand(
     *,
     transpose: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the MXFP8 data and scale for the left operand orientation."""
     if transpose:
         if not tensor.is_colwise():
             raise ValueError(
@@ -281,6 +282,7 @@ def _right_operand(
     *,
     transpose: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the MXFP8 data and scale for the right operand orientation."""
     if transpose:
         if not tensor.is_rowwise():
             raise ValueError(

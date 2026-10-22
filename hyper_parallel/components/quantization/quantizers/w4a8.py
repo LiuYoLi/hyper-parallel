@@ -61,6 +61,7 @@ class W4A8Quantizer(Quantizer):
         group_list: Optional[torch.Tensor],
         group_list_type: int,
     ) -> None:
+        """Validate the grouped activation metadata representation."""
         if group_list_type not in (GROUP_LIST_OFFSETS, GROUP_LIST_COUNTS):
             raise ValueError(
                 "W4A8 group_list_type must be 0 or 1, "
@@ -93,6 +94,7 @@ class W4A8Quantizer(Quantizer):
         group_list: Optional[torch.Tensor],
         group_list_type: int,
     ) -> W4A8Tensor:
+        """Quantize activations into the native W4A8 directions."""
         row_data = row_scale = col_data = col_scale = None
         boundaries = self._boundaries(group_list, group_list_type)
         if rowwise:
@@ -135,6 +137,7 @@ class W4A8Quantizer(Quantizer):
         rowwise: bool,
         colwise: bool,
     ) -> W4A8Tensor:
+        """Pack master weights into the native MXFP4 representation."""
         if any(dimension % MX_BLOCK_SIZE_32 for dimension in tensor.shape[1:]):
             raise ValueError(
                 "Native MXFP4 weight dimensions must be divisible by 32, "

@@ -121,6 +121,7 @@ class FakeW4A8GroupedLinear(GroupedLinear):
 
     @staticmethod
     def _select_operands(left, right, layout: str):
+        """Select directional data and scales for one GMM layout."""
         if layout == "NN":
             left_data, left_scale = left.row_data, left.row_scale
             right_data, right_scale = right.col_data, right.col_scale

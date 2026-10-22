@@ -15,6 +15,7 @@
 """CPU-only contracts for the low-precision policy catalog."""
 
 import unittest
+from typing import Any
 
 from torch import nn
 
@@ -42,7 +43,8 @@ cpu_test = arg_mark(
 class _SourceModule(nn.Module):
     """Importable source type used by the plan-override test."""
 
-    def forward(self, value):
+    def forward(self, value: Any) -> Any:
+        """Return the input unchanged for replacement matching tests."""
         return value
 
 
@@ -162,7 +164,10 @@ class TestLowPrecisionConfig(unittest.TestCase):
         received = []
 
         @module_replacement
-        def capture(*, module, module_fqn, context):
+        def capture(
+            *, module: nn.Module, module_fqn: str, context: dict[str, Any]
+        ) -> nn.Module:
+            """Record replacement context and return the original module."""
             del module_fqn
             received.append(context)
             return module
@@ -202,7 +207,10 @@ class TestLowPrecisionConfig(unittest.TestCase):
     def test_plan_override_policy_requires_low_precision_condition(self):
         """A named policy cannot be attached to an unconditional replacement."""
         @module_replacement
-        def identity(*, module, module_fqn, context):
+        def identity(
+            *, module: nn.Module, module_fqn: str, context: dict[str, Any]
+        ) -> nn.Module:
+            """Return the original module without applying a policy."""
             del module_fqn, context
             return module
 

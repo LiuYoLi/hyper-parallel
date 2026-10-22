@@ -400,7 +400,9 @@ def validate_grouped_linear_inputs(
         )
 
 
-class _GroupedLinearFunction(torch.autograd.Function):
+# PyTorch's Function base exposes variadic callbacks; this bridge intentionally
+# specializes them for the grouped-linear ``apply`` contract.
+class _GroupedLinearFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
     """Bridge PyTorch autograd callbacks to the strategy selected for the call.
 
     Model adapters pass the strategy instance into ``apply`` as an argument;
@@ -411,7 +413,7 @@ class _GroupedLinearFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(
+    def forward(  # pylint: disable=arguments-differ
         ctx: torch.autograd.function.FunctionCtx,
         inputs: torch.Tensor,
         weight: torch.Tensor,
@@ -430,7 +432,7 @@ class _GroupedLinearFunction(torch.autograd.Function):
         )
 
     @staticmethod
-    def backward(
+    def backward(  # pylint: disable=arguments-differ
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
     ) -> tuple[
