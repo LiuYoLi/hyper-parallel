@@ -19,7 +19,9 @@ __all__ = [
     "build_runtime_config",
     "optional_mapping",
     "required_mapping",
+    "resolve_router_replay_config",
     "resolve_vllm_automatic_limits",
+    "router_replay_mode",
     "model_trust_remote_code",
     "tokenizer_trust_remote_code",
     "trainer_attention_implementation",
@@ -41,8 +43,9 @@ import yaml
 from rl.agentic.core.types import InteractionMode
 from rl.agentic.envs.environment import ENVIRONMENTS, load_agentic_module
 from rl.algorithm.loss import RLAlgorithm
+from rl.distillation.config import parse_distillation_config
 from rl.consistency import CONSISTENCY_PROFILE_OFF, consistency_profile, validate_consistency_model_identity
-from rl.dataset.data_source import validate_row_adapter_config
+from rl.dataset.data_source import validate_chat_template_kwargs, validate_row_adapter_config
 from rl.roles.model_setup import (
     ModelRegistration,
     model_trust_remote_code,
@@ -90,6 +93,7 @@ _EXPECTED_TOP_LEVEL = frozenset(
         "logging",
         "consistency",
         "reward_model",
+        "distillation",
     )
 )
 
@@ -298,6 +302,11 @@ def _validate_vllm_basics(vllm: Mapping[str, Any]) -> tuple[str, int, int]:
             "rollout.vllm.deployment must be 'disjoint' or 'colocated', "
             f"got {deployment!r}"
         )
+    sleep_level = vllm.get("sleep_level", 1)
+    if not isinstance(sleep_level, int) or isinstance(sleep_level, bool) or sleep_level not in (1, 2):
+        raise ValueError("rollout.vllm.sleep_level must be an integer equal to 1 or 2")
+    if sleep_level == 2 and deployment != "colocated":
+        raise ValueError("rollout.vllm.sleep_level=2 requires deployment='colocated'")
     rollout_dp = _positive_integer(vllm, "data_parallel_size", "rollout.vllm")
     rollout_tp = _positive_integer(vllm, "tensor_parallel_size", "rollout.vllm")
     if str(vllm.get("dtype", "bfloat16")) not in ("bfloat16", "bf16"):
@@ -450,6 +459,7 @@ def _validate_trainer_ep(accelerator: Mapping[str, Any]) -> None:
 
 def _validate_model_scope(config: Mapping[str, Any], model: ModelRegistration) -> None:
     """Validate checkpoint-specific RL boundaries before constructing roles."""
+    _validate_router_replay(config, model)
     accelerator = required_mapping(required_mapping(config, "train"), "accelerator")
     if model.family == "qwen3":
         _validate_trainer_ep(accelerator)
@@ -472,6 +482,57 @@ def _validate_model_scope(config: Mapping[str, Any], model: ModelRegistration) -
     if vllm.get("enable_eplb", False):
         raise ValueError("Qwen3-MoE does not support enable_eplb")
     _validate_moe_parallelism(accelerator, model)
+
+
+def router_replay_mode(config: Mapping[str, Any]) -> str:
+    """Read the single RL-owned replay switch, rejecting unsupported modes."""
+    replay = optional_mapping(required_mapping(config, "train"), "router_replay")
+    if set(replay) - {"mode"}:
+        raise ValueError("train.router_replay only supports the mode field")
+    mode = replay.get("mode", "disabled")
+    if mode not in ("disabled", "R3"):
+        raise ValueError("train.router_replay.mode must be disabled or R3")
+    return mode
+
+
+def resolve_router_replay_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive rollout capture from the replay switch without mutating the recipe."""
+    resolved = deepcopy(dict(config))
+    enabled = router_replay_mode(resolved) == "R3"
+    vllm = optional_mapping(required_mapping(resolved, "rollout"), "vllm")
+    if ("enable_return_routed_experts" in vllm
+            and vllm["enable_return_routed_experts"] is not enabled):
+        raise ValueError("rollout.vllm.enable_return_routed_experts must match train.router_replay.mode")
+    if enabled:
+        resolved["rollout"].setdefault("vllm", {})["enable_return_routed_experts"] = True
+    return resolved
+
+
+def _validate_router_replay(config: Mapping[str, Any], model: ModelRegistration) -> None:
+    """Fail before model allocation for unsupported replay backends and runners."""
+    enabled = router_replay_mode(config) == "R3"
+    vllm = optional_mapping(required_mapping(config, "rollout"), "vllm")
+    if ("enable_return_routed_experts" in vllm
+            and vllm["enable_return_routed_experts"] is not enabled):
+        raise ValueError("rollout.vllm.enable_return_routed_experts must match train.router_replay.mode")
+    if not enabled:
+        return
+    if parse_distillation_config(config.get("distillation")).enabled:
+        raise ValueError("R3 does not support enabled distillation")
+    if model.family != "qwen3_moe":
+        raise ValueError("R3 currently requires a Qwen3-MoE router adapter")
+    agentic = required_mapping(config, "agentic")
+    if agentic.get("runner", "internal") not in ("internal", "codex"):
+        raise ValueError("R3 currently supports only internal and Codex runners")
+    if vllm.get("data_parallel_size", 1) != 1:
+        raise ValueError(
+            "R3 requires rollout.vllm.data_parallel_size=1: router capture in fixed "
+            "vLLM 0.23.0/vLLM-Ascend 0.23.0.post1 does not support DP padding"
+        )
+    if vllm.get("enforce_eager", True) is not True:
+        raise ValueError("R3 currently requires rollout.vllm.enforce_eager=true")
+    if vllm.get("logprobs_mode") != "raw_logprobs":
+        raise ValueError("R3 requires rollout.vllm.logprobs_mode=raw_logprobs")
 
 
 def _validate_qwen3_5_scope(config: Mapping[str, Any], accelerator: Mapping[str, Any]) -> None:
@@ -798,15 +859,35 @@ def _validate_critic(
             raise ValueError("PPO Critic requires a dense Qwen3 checkpoint")
 
 
+def _validate_distillation(config: Mapping[str, Any]) -> None:
+    """Validate distillation sampling and task-reward contracts."""
+    distillation = parse_distillation_config(config.get('distillation'))
+    if distillation.enabled:
+        if 'reward_model' in config and not distillation.use_task_rewards:
+            raise ValueError('Pure OPD cannot request task reward-model scoring')
+        rollout_settings = required_mapping(config, 'rollout')
+        if (float(rollout_settings.get('temperature', 1.0)) != 1.0
+                or float(rollout_settings.get('top_p', 1.0)) != 1.0
+                or int(rollout_settings.get('top_k', 0)) not in (0, -1)):
+            raise ValueError('Initial PG OPD requires temperature=1, top_p=1 and disabled top_k')
+        if required_mapping(rollout_settings, 'vllm').get('logprobs_mode') != 'raw_logprobs':
+            raise ValueError('PG OPD requires rollout.vllm.logprobs_mode=raw_logprobs')
+        if (required_mapping(config, 'agentic').get('runner', 'internal') != 'internal'
+                and not distillation.use_task_rewards):
+            raise ValueError('Pure OPD currently requires the internal runner; external agents retain episode GRPO')
+
+
 def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     """Validate Hyper-RL configuration before distributed startup."""
     unknown = set(config) - _EXPECTED_TOP_LEVEL
     if unknown:
         raise ValueError(f"Unsupported top-level configuration keys: {sorted(unknown)}")
+    _validate_distillation(config)
     consistency_profile(config)
     model = required_mapping(config, "model")
     data = required_mapping(config, "data")
     validate_row_adapter_config(data)
+    validate_chat_template_kwargs(data.get("chat_template_kwargs"))
     rollout = required_mapping(config, "rollout")
     agentic = required_mapping(config, "agentic")
     if agentic.get("runner") in {"codex", "deepseek"} and algorithm.name != "grpo":
@@ -814,9 +895,20 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
         raise ValueError(f"Segmented {name} agent trajectories currently require GRPO")
     evaluation = required_mapping(config, "evaluation")
     train = required_mapping(config, "train")
+    if train.get("model_init_cpu_threads") is not None:
+        _positive_integer(train, "model_init_cpu_threads", "train")
     accelerator = required_mapping(train, "accelerator")
+    optimizer = required_mapping(train, "optimizer")
+    main_params = _optimizer_fp32_main_params(optimizer)
+    mixed_precision = required_mapping(train, "mixed_precision")
+    if main_params and (not mixed_precision.get("enabled", True) or
+                        _normalize_dtype_name(mixed_precision.get("reduce_dtype", "float32")) != "float32"):
+        raise ValueError("FP32 main parameters require enabled mixed precision and float32 gradient reduction")
     if algorithm.requirements.roles.critic:
         _validate_critic(train, rollout, model)
+        critic_optimizer = {**optimizer, **optional_mapping(optional_mapping(train, "critic"), "optimizer")}
+        if _optimizer_fp32_main_params(critic_optimizer) != main_params:
+            raise ValueError("Actor and Critic must use the same fp32_main_params policy")
     model_registration = build_model_registration(config)
     _validate_model_scope(config, model_registration)
     validate_consistency_model_identity(config, model_registration)
@@ -826,7 +918,20 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     validate_rollout_and_agentic(rollout, agentic, accelerator, model_registration)
     if rollout.get("engine") != "vllm":
         _ = _trainer_topology(accelerator)
-    _validate_checkpoint(required_mapping(train, "checkpoint"))
+    checkpoint = required_mapping(train, "checkpoint")
+    _validate_checkpoint(checkpoint)
+    if rollout.get("engine") == "vllm" and optional_mapping(rollout, "vllm").get("sleep_level", 1) == 2:
+        save_steps = int(checkpoint.get("save_steps", 0))
+        if 0 < save_steps < int(train["max_steps"]):
+            raise ValueError(
+                "rollout.vllm.sleep_level=2 does not support intermediate checkpoints: "
+                "resuming rollout requires a complete weight publication"
+            )
+        if "reward_model" in config and bool(evaluation.get("enabled", True)):
+            raise ValueError(
+                "rollout.vllm.sleep_level=2 does not support reward_model with evaluation.enabled=true: "
+                "resuming rollout after reward scoring requires a complete weight publication"
+            )
     _validate_logging(required_mapping(config, "logging"))
     if "reward_model" in config:
         _validate_reward_model(config, model_registration)
@@ -1389,7 +1494,10 @@ def build_runtime_config(config: Mapping[str, Any], *, critic: bool = False) -> 
             family=registration.family,
         ),
         plan_overrides=_model_plan_overrides(registration.family),
-        optimizer=OptimizerConfig(target=_build_optimizer_target(optimizer_config)),
+        optimizer=OptimizerConfig(
+            target=_build_optimizer_target(optimizer_config),
+            fp32_main_params=_optimizer_fp32_main_params(optimizer_config),
+        ),
         lr_scheduler=_build_lr_scheduler_target(optimizer_config),
         training=_build_training_config(
             train_config,
@@ -1408,6 +1516,14 @@ def build_runtime_config(config: Mapping[str, Any], *, critic: bool = False) -> 
         ),
         checkpoint=_build_checkpoint_config(checkpoint_config),
     )
+
+
+def _optimizer_fp32_main_params(optimizer_config: Mapping[str, Any]) -> bool:
+    """Select the existing main-parameter optimizer without accepting truthy strings."""
+    value = optimizer_config.get("fp32_main_params", False)
+    if not isinstance(value, bool):
+        raise ValueError("train.optimizer.fp32_main_params must be a boolean")
+    return value
 
 
 def _validate_vllm_hccl_ports(vllm: Mapping[str, Any]) -> None:

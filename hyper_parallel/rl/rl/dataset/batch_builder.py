@@ -77,6 +77,17 @@ def _uses_log_probs(trajectories: tuple[Trajectory, ...], settings: GenerationSe
     return collect_log_probs
 
 
+def _router_traces(trajectories: tuple[Trajectory, ...], settings: GenerationSettings) -> Optional[tuple]:
+    """Keep row-aligned CPU routes and reject missing required captures."""
+    if settings.collect_router_trace and any(
+        row.router_trace is None and not row.metadata.get("dp_padding", False) for row in trajectories
+    ):
+        raise ValueError("R3 trajectories must provide router traces for every real row")
+    if not settings.collect_router_trace and not any(row.router_trace is not None for row in trajectories):
+        return None
+    return tuple(row.router_trace for row in trajectories)
+
+
 def build_experience_batch(
     trajectories: tuple[Trajectory, ...],
     generation_seconds: float,
@@ -118,10 +129,12 @@ def build_experience_batch(
         action_mask=action_mask,
         rewards=rewards,
         old_log_probs=old_log_probs,
+        rollout_log_probs=_detached(old_log_probs),
         responses=responses,
         generation_seconds=generation_seconds,
         worker_policy_version=worker_versions.pop(),
         metadata=batch_metadata,
+        router_traces=_router_traces(trajectories, settings),
     )
 
 
@@ -158,6 +171,9 @@ def _append_padding_rows(rollout: ExperienceBatch, missing: int) -> ExperienceBa
         action_mask=torch.zeros_like(template.action_mask), reward=0.0, reward_components={},
         rollout_log_probs=None if template.rollout_log_probs is None else torch.zeros_like(template.rollout_log_probs),
         metadata={"dp_padding": True},
+        router_trace=(None if template.router_trace is None else replace(
+            template.router_trace, valid_mask=torch.zeros_like(template.router_trace.valid_mask),
+        )),
     ) for index in range(missing))
     selection = slice(source, source + 1)
     return replace(
@@ -171,7 +187,14 @@ def _append_padding_rows(rollout: ExperienceBatch, missing: int) -> ExperienceBa
         old_log_probs=(None if rollout.old_log_probs is None else torch.cat((
             rollout.old_log_probs, rollout.old_log_probs.new_zeros((missing, rollout.old_log_probs.shape[1])),
         ))),
+        rollout_log_probs=(None if rollout.rollout_log_probs is None else torch.cat((
+            rollout.rollout_log_probs,
+            rollout.rollout_log_probs.new_zeros((missing, rollout.rollout_log_probs.shape[1])),
+        ))),
         responses=rollout.responses + ("",) * missing,
+        router_traces=(None if rollout.router_traces is None else rollout.router_traces + tuple(
+            row.router_trace for row in padding
+        )),
         metadata={**rollout.metadata, "dp_padding_rows": rollout.metadata.get("dp_padding_rows", 0) + missing},
     )
 

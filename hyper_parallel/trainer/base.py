@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
@@ -71,8 +72,11 @@ from hyper_parallel.trainer.runtime.distributed import (
 from hyper_parallel.trainer.runtime.logging import setup_logging
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
+from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
+from hyper_parallel.components.modules.moe_utils import MoEMonitorCallback
 from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel
 from hyper_parallel.models._transformers.model_builder import _validate_optimize_dtype
+from hyper_parallel.models.external_state import get_model_external_state
 from hyper_parallel.components.losses.model_output import ModelOutputLoss
 from hyper_parallel.core.optimizer import (
     ChainedOptimizer,
@@ -125,7 +129,6 @@ def _to_swap_optimizer_config(config: OptimizerSwapConfig) -> SwapOptimizerConfi
         swap_times=config.swap_times,
         state_keys=config.state_keys,
         min_numel=config.min_numel,
-        include_master_params=config.include_master_params,
         # ``None`` means "leave it to the backend default", not "off": the core
         # config declares ``packed_swap: bool = True``, so pass that default
         # through rather than letting ``None`` read as a hard False.
@@ -308,6 +311,9 @@ class BaseTrainer(Stateful, ABC):
 
         # Initialize distributed process group
         backend = getattr(self.config.training, "backend", "nccl")
+        if backend == "hccl" and self.config.training.enable_full_determinism:
+            # HCCL reads this when creating communicators, before set_seed runs below.
+            os.environ["HCCL_DETERMINISTIC"] = "true"
         initialize_distributed(backend=backend)
 
         self.local_rank = get_local_rank_safe()
@@ -364,6 +370,8 @@ class BaseTrainer(Stateful, ABC):
             activation_checkpoint=self.config.activation_checkpoint.mode,
             activation_checkpoint_selection=self.config.activation_checkpoint.selection,
             swap_inputs=getattr(self.config.activation_checkpoint, "swap_inputs", False),
+            allow_cache_entry_mutation=getattr(
+                self.config.activation_checkpoint, "allow_cache_entry_mutation", False),
             activation_swap=self.config.activation_swap,
             compile_config=self.config.compile,
             codegen=self.config.codegen,
@@ -509,15 +517,33 @@ class BaseTrainer(Stateful, ABC):
     def _build_optimizer(self) -> None:
         """Build the configured optimizer with the runtime model context."""
         config: TrainerConfig = self.config
+        external = get_model_external_state(self.model)
+        if external is not None:
+            def wrap_dense(dense_raw: Any) -> Any:
+                """Wrap dense parameters in FP32 main and optional state swap.
+
+                Args:
+                    dense_raw: Constructed dense optimizer.
+                """
+                dense = (
+                    Float16OptimizerWithFloat16Params(dense_raw, self.model)
+                    if config.optimizer.fp32_main_params else dense_raw
+                )
+                if config.optimizer.swap.enabled:
+                    dense = _attach_optimizer_swap(dense, config.optimizer.swap)
+                return dense
+
+            self.optimizer = external.build_optimizer(config.optimizer, wrap_dense=wrap_dense)
+            return
         optimizer = config.optimizer.target.build(model=self.model).get_optimizer()
         self.optimizer = (
             Float16OptimizerWithFloat16Params(optimizer, self.model)
             if config.optimizer.fp32_main_params
             else optimizer
         )
-        # Swap is attached after the fp32 main-parameter wrap: that wrapper owns
-        # the master parameters ``include_master_params`` swaps, and the lr
-        # scheduler built right after reads ``self.optimizer.param_groups``.
+        # Swap is attached after the fp32 main-parameter wrap so leaf optimizers
+        # already reference their final parameters, and the lr scheduler built
+        # right after reads the wrapped ``self.optimizer.param_groups``.
         if config.optimizer.swap.enabled:
             self.optimizer = _attach_optimizer_swap(self.optimizer, config.optimizer.swap)
 
@@ -559,8 +585,10 @@ class BaseTrainer(Stateful, ABC):
             model: torch.nn.Module,
             model_inputs: Dict[str, Any],
             labels: Optional[torch.Tensor],
+            current_token_counts: Dict[str, torch.Tensor],
+            step_token_counts: Dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Wrap the BaseTrainer forward/loss logic for joint-graph capture."""
+        """Capture forward/loss with explicit runtime token counts."""
         model_fwd_context = (
             self.model_fwd_context()
             if callable(self.model_fwd_context)
@@ -568,17 +596,23 @@ class BaseTrainer(Stateful, ABC):
         )
         with model_fwd_context:
             outputs = model(**model_inputs, use_cache=False)
-        # postforward adds the token-weighted global aggregation used by the
-        # eager path; it embeds .item()/all_reduce, which the tracer must be
-        # able to capture for this to compile. Both the backward loss and the
-        # named per-key losses are returned: the tracer emits the loss_dict
-        # values as extra graph outputs (after the gradients), so
-        # multi-key losses keep per-key logging parity with the eager path.
-        loss, loss_dict = self.postforward(outputs, labels)
+        # Counts must be graph inputs: packed lengths and ignored-label counts
+        # can vary even when tensor shapes happen to match the first batch.
+        loss, loss_dict = self.postforward(
+            outputs, labels,
+            current_token_counts=current_token_counts,
+            step_token_counts=step_token_counts,
+        )
         return loss, loss_dict
 
     def _init_callbacks(self):
         """Initialize callbacks."""
+        dp_cp_mesh = self.mesh.dp_cp_mesh
+        self.moe_monitor = MoEMonitorCallback(
+            self.model,
+            dp_group=dp_cp_mesh.get_group() if dp_cp_mesh is not None else None,
+            tp_group=self.device_mesh["tp"].get_group() if self.mesh.sequence_parallel else None,
+        )
         self.state = TrainerState()
         self.environ_meter_callback = EnvironMeterCallback(self)
         self.tqdm_callback = TqdmCallback(self)
@@ -685,22 +719,30 @@ class BaseTrainer(Stateful, ABC):
         return micro_batch
 
     def postforward(
-            self, outputs: ModelOutput, labels: Optional[torch.Tensor]
+            self, outputs: ModelOutput, labels: Optional[torch.Tensor],
+            *,
+            current_token_counts: Dict[str, torch.Tensor],
+            step_token_counts: Dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass.
 
         Args:
             outputs: Model outputs consumed by the configured loss.
             labels: Labels associated with the current micro-batch.
+            current_token_counts: Per-loss token counts for the current micro-batch.
+            step_token_counts: Per-loss token counts for the optimizer step.
 
         Returns:
             Backward loss and named globally aggregated loss values.
         """
         local_loss = self.loss_fn(model_output=outputs, labels=labels)
+        foundation_loss = local_loss.get("foundation_loss") if isinstance(local_loss, dict) else local_loss
+        if foundation_loss is not None:
+            bind_aux_loss_scale(foundation_loss)
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             local_loss,
-            self.current_token_counts,
-            self.step_token_counts,
+            current_token_counts,
+            step_token_counts,
             device_mesh=self.mesh,
         )
         loss = torch.stack(list(loss_dict.values())).sum()
@@ -738,7 +780,7 @@ class BaseTrainer(Stateful, ABC):
             if channel_loss_callback is not None
             else nullcontext()
         )
-        with micro_step_context:
+        with micro_step_context, aux_loss_scale_context():
             micro_batch = self.preforward(micro_batch)
             # TextTrainer passes loss-only fields separately. Keep the legacy
             # BaseTrainer/VLM one-dictionary call contract working as well.
@@ -777,6 +819,8 @@ class BaseTrainer(Stateful, ABC):
                 loss, loss_dict = self.graph_compiler.forward_backward(
                     model_inputs=micro_batch,
                     labels=labels,
+                    current_token_counts=self.current_token_counts,
+                    step_token_counts=self.step_token_counts,
                 )
             else:
                 model_fwd_context = (
@@ -788,7 +832,11 @@ class BaseTrainer(Stateful, ABC):
                     outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
                 # with use_parallel_state("base"):
-                loss, loss_dict = self.postforward(outputs, labels)
+                loss, loss_dict = self.postforward(
+                    outputs, labels,
+                    current_token_counts=self.current_token_counts,
+                    step_token_counts=self.step_token_counts,
+                )
                 # The loss graph owns everything required for backward. Releasing
                 # the model output here avoids retaining large vocabulary logits
                 # until the whole backward pass finishes.
@@ -832,7 +880,11 @@ class BaseTrainer(Stateful, ABC):
         self._configure_fsdp_gradient_sync(micro_step, num_micro_steps)
 
     def begin_fsdp_runtime_diagnostics(self, micro_step: int) -> None:
-        """Begin observing one FSDP forward/backward micro-step when enabled."""
+        """Begin observing one FSDP forward/backward micro-step when enabled.
+
+        Args:
+            micro_step: Microbatch index.
+        """
         if self.fsdp_runtime_diagnostics is not None:
             self.fsdp_runtime_diagnostics.begin_micro_step(
                 self.state.global_step,
@@ -852,6 +904,11 @@ class BaseTrainer(Stateful, ABC):
         self.model_integration.after_backward_before_clip()
         self.validate_fsdp_runtime_before_optimizer()
         max_grad_norm = self.config.training.max_grad_norm
+        external = get_model_external_state(self.model)
+        if external is not None:
+            preparation = external.prepare_optimizer_step(max_norm=max_grad_norm)
+            self.model_integration.after_clip(preparation.post_clip_norm)
+            return preparation.global_norm
         grad_norm: Any = 0.0
         post_clip_norm = None
         if max_grad_norm > 0:
@@ -881,6 +938,9 @@ class BaseTrainer(Stateful, ABC):
             with SkipDTensorDispatch(no_skip={torch.zeros_like}):
                 optimizer.step()
             optimizer.zero_grad()
+        moe_monitor = getattr(self, "moe_monitor", None)
+        if moe_monitor is not None:
+            moe_monitor.on_step_end()
         self.model_integration.after_optimizer()
 
         schedulers = (
@@ -922,7 +982,11 @@ class BaseTrainer(Stateful, ABC):
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        """Execute one optimizer update from the next dataloader batch."""
+        """Execute one optimizer update from the next dataloader batch.
+
+        Args:
+            data_iterator: Training data iterator.
+        """
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self.state.global_step += 1
 

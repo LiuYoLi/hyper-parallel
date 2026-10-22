@@ -18,7 +18,7 @@
 import copy
 import unittest
 from itertools import product
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, mock_open, patch
 
 import torch
@@ -30,9 +30,14 @@ try:
 except ImportError as exc:
     raise unittest.SkipTest(f"DeepSeek-V4 Transformers dependency unavailable: {exc}") from exc
 
+from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedPackedSequence
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     deepseek_v41_ep_compute_fn,
+    deepseek_v41_megamoe_compute_fn,
 )
+from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
+from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
 from hyper_parallel.models.deepseek_v41.adapter.validation.native_module_parity import HyperParallelMoE
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41Model,
@@ -84,6 +89,105 @@ def _native_shared_oracle(module: torch.nn.Module, states: torch.Tensor) -> torc
 
 class TestV41SharedExpert(unittest.TestCase):
     """Check activation precision, autograd, state compatibility, and entry points."""
+
+    def test_megamoe_workspace_prepared_once_before_forward(self) -> None:
+        """Prepare model-owned expert sharing before the first native submission.
+
+        Feature: DSV4.1-owned MegaMoe workspace preparation.
+        Description: Run text/VLM backbones twice with two configured expert layers.
+        Expectation: The first expert call sees shared resources, prepared only once.
+        """
+        for vision_enabled in (False, True):
+            with self.subTest(vision_enabled=vision_enabled):
+                config = _config()
+                config.num_hidden_layers = 2
+                config.layer_types = ["sliding_attention"] * 2
+                config.mlp_layer_types = ["moe"] * 2
+                config.v41_compress_ratios = [0, 0]
+                config.v41_vision_enabled = vision_enabled
+                with patch(
+                        "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.Path.open",
+                        mock_open(read_data='{"layer_ids": []}')):
+                    model = DeepseekV41Model(config)
+                experts = []
+                for layer in model.layers:
+                    layer.mlp.experts = DeepseekV41MegaMoeExperts(module=layer.mlp.experts, local_num_tokens=128)
+                    self.addCleanup(layer.mlp.experts.close_runtime)
+                    compute = deepseek_v41_megamoe_compute_fn(
+                        module=layer.mlp, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=None,
+                    )
+                    layer.mlp.forward = MethodType(compute, layer.mlp)
+                    experts.append(layer.mlp.experts)
+
+                def execute(hidden_states: torch.Tensor, *_args: object,
+                            expert_group: tuple = tuple(experts), **_kwargs: object) -> torch.Tensor:
+                    """Check sharing at the actual executor boundary without native hardware."""
+                    # The shared resource group is intentionally private to the executors.
+                    self.assertIs(expert_group[0]._executor._resource_group,  # pylint: disable=protected-access
+                                  expert_group[1]._executor._resource_group)  # pylint: disable=protected-access
+                    return torch.zeros_like(hidden_states)
+
+                with (patch.object(DeepseekV41MegaMoeExperts, 'prepare_runtime_group',
+                                   wraps=DeepseekV41MegaMoeExperts.prepare_runtime_group) as prepare,
+                      patch.object(MegaMoeExperts, 'forward', side_effect=execute) as forward):
+                    for _ in range(2):
+                        output = model(input_ids=torch.tensor([[1, 2, 3, 4]])).last_hidden_state
+                        self.assertTrue(torch.isfinite(output).all())
+                prepare.assert_called_once_with(experts)
+                self.assertEqual(forward.call_count, 4)
+
+    def test_shifted_mhc_preserves_dspark_targets_and_backbone_gradients(self) -> None:
+        """Keep DSpark targets and backbone training equivalent after mHC replacement.
+
+        Feature: Single-pass mHC and DSpark backbone integration.
+        Description: Compare two real backbone layers with ordinary and shifted mHC.
+        Expectation: Outputs, detached DSpark targets, and parameter gradients match.
+        """
+        torch.manual_seed(94)
+        config = _config()
+        config.num_hidden_layers = 2
+        config.layer_types = ["sliding_attention"] * 2
+        config.mlp_layer_types = ["moe"] * 2
+        config.v41_compress_ratios = [0, 0]
+        config.v41_dspark_target_layer_ids = [0, 1]
+        config.router_aux_loss_coef = 0.1
+        config.hc_mult = 4
+        config.hc_sinkhorn_iters = 20
+        with patch(
+                "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.Path.open",
+                mock_open(read_data='{"layer_ids": []}')):
+            reference = DeepseekV41Model(config)
+        shifted = copy.deepcopy(reference)
+        for layer in shifted.layers:
+            layer.attn_hc = DeepseekV41HyperMegaMhc(module=layer.attn_hc)
+            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=layer.ffn_hc)
+        input_ids = torch.tensor([[1, 2, 3, 4]])
+        packed = SharedCompressedPackedSequence(
+            cu_seq_lens=torch.tensor([0, 1, 4], dtype=torch.int32),
+            local_query_start=0,
+            local_query_length=4,
+            global_sequence_length=4,
+        )
+
+        expected = reference(input_ids=input_ids, packed_seq_params=packed).last_hidden_state
+        actual = shifted(input_ids=input_ids, packed_seq_params=packed).last_hidden_state
+
+        torch.testing.assert_close(actual, expected)
+        for layer, expected_layer in zip(shifted.layers, reference.layers):
+            torch.testing.assert_close(layer.mlp.gate.last_aux_loss, expected_layer.mlp.gate.last_aux_loss)
+        self.assertEqual(len(shifted.dspark_target_hiddens), 2)
+        for target, expected_target in zip(shifted.dspark_target_hiddens, reference.dspark_target_hiddens):
+            torch.testing.assert_close(target, expected_target)
+            self.assertFalse(target.requires_grad)
+        self.assertFalse(shifted.dspark_inputs_embeds.requires_grad)
+        expected.square().sum().backward()
+        actual.square().sum().backward()
+        for name, parameter in shifted.named_parameters():
+            expected_grad = reference.get_parameter(name).grad
+            if expected_grad is None:
+                self.assertIsNone(parameter.grad)
+            else:
+                torch.testing.assert_close(parameter.grad, expected_grad)
 
     def test_forward_and_backward_match_native_formula(self) -> None:
         """FP32/BF16, positive/nonpositive limits, and empty inputs retain parity."""

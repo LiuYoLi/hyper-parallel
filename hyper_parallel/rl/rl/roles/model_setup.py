@@ -41,6 +41,7 @@ from typing import Any, Iterator, Mapping, Optional
 import torch
 
 from hyper_parallel import HSDPModule
+from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
 from hyper_parallel.models.qwen3_5.adapter.selected_log_probs import bind_token_log_probs
 
 _TRANSFORMERS_BUILTIN_ATTENTION = "transformers_builtin"
@@ -171,14 +172,27 @@ def resolve_vllm_model(
     return VLLMModelRegistration(model, normalized, architecture)
 
 
-def build_role_model(runtime_config: object, distributed_setup: object, *, frozen: bool) -> torch.nn.Module:
-    """Build one finalized role model through the shared atomic model loader."""
+def build_role_model(
+    runtime_config: object, distributed_setup: object, *, frozen: bool, cpu_threads: Optional[int] = None,
+) -> torch.nn.Module:
+    """Build one finalized role, optionally changing intra-op threads only during model construction."""
+    if cpu_threads is not None and (
+        not isinstance(cpu_threads, int) or isinstance(cpu_threads, bool) or cpu_threads <= 0
+    ):
+        raise ValueError("cpu_threads must be a positive integer or None")
     activation_checkpoint = getattr(runtime_config.activation_checkpoint, "mode", "off")
-    model = runtime_config.model.build(
-        distributed_setup=distributed_setup,
-        activation_checkpoint=activation_checkpoint,
-        peft_config=runtime_config.peft,
-    )
+    previous_threads = None if cpu_threads is None else torch.get_num_threads()
+    try:
+        if cpu_threads is not None:
+            torch.set_num_threads(cpu_threads)
+        model = runtime_config.model.build(
+            distributed_setup=distributed_setup,
+            activation_checkpoint=activation_checkpoint,
+            peft_config=runtime_config.peft,
+        )
+    finally:
+        if previous_threads is not None:
+            torch.set_num_threads(previous_threads)
     if getattr(getattr(model, "config", None), "model_type", None) == "qwen3_5_text":
         bind_token_log_probs(model)
     if frozen:
@@ -191,6 +205,8 @@ def build_role_model(runtime_config: object, distributed_setup: object, *, froze
 def build_role_optimizer(runtime_config: object, model: torch.nn.Module) -> tuple[object, object]:
     """Build an independent optimizer and scheduler for one trainable role."""
     optimizer = runtime_config.optimizer.target.build(model=model).get_optimizer()
+    if getattr(runtime_config.optimizer, "fp32_main_params", False):
+        optimizer = Float16OptimizerWithFloat16Params(optimizer, model)
     lr_scheduler = None
     if runtime_config.lr_scheduler is not None:
         lr_scheduler = runtime_config.lr_scheduler.build(

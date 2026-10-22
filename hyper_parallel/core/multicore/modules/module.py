@@ -153,7 +153,7 @@ class _MulticoreResourceManager:
 
     @staticmethod
     def _exchange(value: Any) -> list[Any]:
-        """Exchange lifecycle metadata on the complete distributed world."""
+        """Exchange lifecycle metadata on the registered communication root."""
         return _automatic.exchange(value)
 
     def close_groups(self, groups: Iterable[_ExecutionResourceGroup] | None = None) -> None:
@@ -349,9 +349,9 @@ class MulticoreModule(torch.nn.Module):
         binding = self._execution_binding(tensor)
         if group.resources is None:
             group.module_type = type(self)
+            _automatic.register(_RESOURCE_MANAGER.close_groups, self._root_group())
             _RESOURCE_MANAGER.recycle(group, binding, self._resource_signature(tensor))
         if group.resources is None:
-            _automatic.register(_RESOURCE_MANAGER.close_groups, self._root_group())
             active_specs = _RESOURCE_MANAGER.active_specifications(group.scope_key)
             group.resources = self._create_execution_resources(
                 tensor,
@@ -361,7 +361,7 @@ class MulticoreModule(torch.nn.Module):
             group.binding = binding
             group.binding_id = next(_RESOURCE_MANAGER._next_binding_id)  # pylint: disable=protected-access
             if _RESOURCE_MANAGER.runtime_release is None:
-                self._retain_runtime(_RESOURCE_MANAGER)
+                self._register_runtime_release(_RESOURCE_MANAGER, group.resources)
         elif binding != group.binding:
             raise ValueError(
                 "multicore resources are bound to the first input device/dtype "
@@ -373,8 +373,12 @@ class MulticoreModule(torch.nn.Module):
         """Identify a collective first binding without rank-local device indices."""
         return type(self).__module__, type(self).__qualname__, str(tensor.dtype)
 
-    def _retain_runtime(self, manager: _MulticoreResourceManager) -> None:
-        """Optionally pin the runtime across orphan replacement allocations."""
+    def _register_runtime_release(
+        self,
+        manager: _MulticoreResourceManager,
+        resources: Any,
+    ) -> None:
+        """Optionally register a final release for resources with a shared Runtime."""
 
     def _root_group(self) -> Any:
         """Return the communication dependency used by these resources."""

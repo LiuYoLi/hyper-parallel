@@ -54,8 +54,12 @@ DeadCodeElimination → CanonicalizeGraph → FSDPPass → PpPass → AutoOverla
   (Replicate → Shard) for `"fsdp"` / `"hsdp"`, `all_reduce` on the
   `dp_replicate` axis for `"ddp"` / `"hsdp"`
 - Physically shards live model parameters (dim 0) so optimizer is FSDP-agnostic
-  (`"ddp"` replicates instead; non-divisible dim-0 params stay replicated
-  rather than erroring)
+  (`"ddp"` replicates instead; a non-divisible dim-0 param is pad-sharded like
+  eager `fully_shard` — dim 0 zero-padded to a multiple of the degree — rather
+  than erroring; a 0-dim scalar stays replicated and is `all_reduce`d)
+- Falls back to DDP for a trainable parameter a partial plan leaves unmarked
+  (kept replicated, gradient all-reduced over the DP group) and logs the
+  fallback
 
 Disable reshard with `PassConfig(fsdp_reshard_after_forward=False)`.
 
@@ -122,6 +126,62 @@ trainer = GraphTrainer(
 trainer.train(dataloader, max_steps=1000)
 ```
 
+## Dynamic input shapes
+
+Static tracing remains the default. Enable symbolic user inputs with one option:
+
+```python
+compiler = GraphCompiler(model=model, train_fn=train_fn, dynamic=True)
+```
+
+For precise control, pass `dynamic_arg_dims` to `GraphCompiler` or `GraphTrainer`:
+
+```python
+compiler = GraphCompiler(
+    model=model,
+    train_fn=lambda m, x, y: ((m(x) - y) ** 2).mean(),
+    dynamic_arg_dims={"x": [0, 1], "y": [0, 1]},
+)
+# x: [batch, sequence, input_features]; y: [batch, sequence, output_features]
+loss, loss_dict = compiler.forward_backward(x=x, y=y)
+```
+
+The first call captures one symbolic forward/backward graph. Later batches with
+compatible batch/sequence lengths reuse it; gradients still accumulate into the
+live parameters. `GraphTrainer` exposes the same options and owns optimizer steps.
+Numerical and graph-reuse regressions live in
+[the CPU unit tests](../../tests/ut/compile/test_dynamic_shapes.py).
+
+For the existing **BaseTrainer + GraphCompiler** path, configure:
+
+```yaml
+compile:
+  enabled: true
+  use_joint_graph: true
+  dynamic_arg_dims:
+    model_inputs.input_ids: [0, 1]
+    labels: [0, 1]
+```
+
+Add paths for other tensors whose sizes vary, such as
+`model_inputs.attention_mask: [0, 1]`. Paths refer to the keyword arguments of
+`train_fn`; BaseTrainer supplies `model_inputs` and `labels`. Use `dynamic: true`
+instead of the mapping to automatically symbolize all user tensor dimensions.
+
+- `dynamic_arg_dims` overrides `dynamic`; unlisted dimensions stay static.
+  Nested input paths and negative dimension indices are supported.
+- Model parameters and buffers keep static shapes. Runtime guards reject
+  incompatible shapes, metadata and Python constants without recompiling.
+- Use a representative first batch with dynamic dimensions **greater than 1**;
+  sizes 0/1 and shape-dependent Python branches may specialize the graph.
+- Dynamic shapes support joint forward/backward graphs, gradient accumulation
+  and optimizer updates. Pipeline parallel and data-dependent output shapes
+  are not supported.
+
+The approach follows MagiCompiler's separation of dynamic and static dimensions
+and reuse of a general symbolic graph, adapted to HyperParallel's joint-graph
+tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
+
 ## Key Design Decisions
 
 1. **Static Inputs**: Parameters are graph inputs, not `get_attr`. This allows passes to split the graph by reshaping placeholders.
@@ -143,9 +203,19 @@ trainer.train(dataloader, max_steps=1000)
 
 ## Limitations
 
-- **Non-divisible parameters are skipped, not errors**: a parameter whose dim 0
-  is not divisible by the DP shard degree (or a scalar parameter) is left
-  replicated on both the graph and the live model.
+- **Non-divisible parameters are pad-sharded, not errors**: a parameter whose
+  dim 0 is not divisible by the DP shard degree is zero-padded to a multiple of
+  the degree and sharded like any other (mirrors eager `fully_shard`): the graph
+  narrows the gathered padded full tensor back to the real size, and the
+  backward pads the gradient back before `reduce_scatter`. A 0-dim scalar cannot
+  be padded (eager `fully_shard` rejects scalars too); it stays replicated and
+  its gradient is `all_reduce`d over the shard axis (and the `dp_replicate` axis
+  for HSDP), so replicas stay synchronized instead of silently diverging.
+- **Partial plans fall back to DDP**: with an explicit `GraphParallelPlan` that
+  leaves some trainable parameters unmarked, those parameters are not
+  FSDP-sharded; they stay replicated and their gradient is `all_reduce`d over
+  the DP group (DDP semantics, so replicas stay in sync). `FSDPPass` logs the
+  fallback naming them.
 - **PP v1 is pure-PP**: `pp_degree == world_size` and `fsdp_enabled=False`.
   PP+FSDP hybrids require a `mesh_context` exposing a pp dim.
 - **`AutoOverlapPass` is a placeholder no-op** — see the pass note above.

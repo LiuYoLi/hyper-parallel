@@ -181,7 +181,11 @@ class TestTrainerConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_compile_config_fields(self):
-        """CompileConfig field order and defaults stay unchanged."""
+        """
+        Feature: Dynamic joint-graph training.
+        Description: CompileConfig field order and defaults stay unchanged.
+        Expectation: Losses, gradients and public contracts remain correct.
+        """
         from hyper_parallel.trainer.config import CompileConfig
 
         self.assertEqual(
@@ -195,6 +199,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("backend", "None"),
                 ("options", "None"),
                 ("dynamo_cache_size_limit", "256"),
+                ("dynamic_arg_dims", "None"),
             ],
         )
 
@@ -261,14 +266,16 @@ class TestOptimizerContracts(unittest.TestCase):
         self.assertEqual(
             str(inspect.signature(optim.AdamW.__init__)),
             "(self, adamw_config: dict, model: torch.nn.modules.module.Module, "
-            "no_decay_params: Optional[List[str]] = None) -> None",
+            "no_decay_params: Optional[List[str]] = None, "
+            "excluded_param_ids: Optional[Sequence[int]] = None) -> None",
         )
         self.assertEqual(
             str(inspect.signature(optim.Muon.__init__)),
             "(self, muon_config: dict, adamw_config: dict, "
             "model: torch.nn.modules.module.Module, "
             "extra_adamw_name_keywords: Optional[List[str]] = None, "
-            "no_decay_params: Optional[List[str]] = None) -> None",
+            "no_decay_params: Optional[List[str]] = None, "
+            "excluded_param_ids: Optional[Sequence[int]] = None) -> None",
         )
         self.assertEqual(
             str(inspect.signature(optim.MixedPrecisionOptimizer.__init__)),
